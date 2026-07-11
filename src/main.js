@@ -13,7 +13,8 @@ let isDrawing=false,drawPts=[];
 let spaceDown=false,mousePanning=false,midPanning=false;
 let panStart,vpAtPanStart,rafId;
 let curSX=-999,curSY=-999;
-let recording=true,replayLog=[],recordStart=null;
+// FIX: initialise recordStart immediately so now() is never NaN
+let recording=true,replayLog=[],recordStart=performance.now();
 
 // ── Worker (OffscreenCanvas + ESM) ──
 const pending=new Map();let sid=0,wk;
@@ -23,10 +24,13 @@ const pending=new Map();let sid=0,wk;
   wk.onmessage=({data})=>{
     if(data.type==='simplified'){pending.get(data.id)?.(data.pts);pending.delete(data.id);}
   };
-  wk.postMessage({type:'init',canvas:off,dpr,vp:{...vp},strokes:[]},[ off]);
+  wk.postMessage({type:'init',canvas:off,dpr,vp:{...vp},strokes:[]},[off]);
 }
 const wr=(ss,v,sz)=>{const m={type:'update',strokes:ss??strokes,vp:v??{...vp}};if(sz)m.size=sz;wk.postMessage(m);};
-const ws=(pts,type,w)=>new Promise(r=>{const id=sid++;pending.set(id,r);wk.postMessage({type:'simplify',id,pts,type,w});});
+// FIX: was {type:'simplify',id,pts,type,w} — duplicate 'type' key meant the stroke-type
+//      variable overwrote 'simplify', so the worker never matched the simplify branch,
+//      pending promises never resolved, and commitStroke hung forever for any stroke > 2pts.
+const ws=(pts,strokeType,w)=>new Promise(r=>{const id=sid++;pending.set(id,r);wk.postMessage({type:'simplify',id,pts,strokeType,w});});
 
 function resize(){
   const W=innerWidth,H=innerHeight,pw=Math.round(W*dpr),ph=Math.round(H*dpr);
@@ -42,7 +46,7 @@ const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
 function setZoom(ns,cx,cy){const rf=ns/vp.scale;vp.x=cx-(cx-vp.x)*rf;vp.y=cy-(cy-vp.y)*rf;vp.scale=ns;ZH.textContent=Math.round(ns*100)+'%';}
 const zoomAt=(f,cx,cy)=>setZoom(clamp(vp.scale*f,.05,20),cx,cy);
 
-// fallback renderStroke (PNG export + live layer only — no grid needed)
+// fallback renderStroke (PNG export only — no grid needed)
 function renderStroke(ctx,s){
   ctx.save();
   if(s.type==='text'){
@@ -102,9 +106,12 @@ function animateCircleSnap(s,cb){
   (function frame(now){
     const t=Math.min((now-t0)/dur,1),sp=t<.65?(t/.65)*1.06:1.06-((t-.65)/.35)*.06;
     lctx.setTransform(1,0,0,1,0,0);lctx.clearRect(0,0,live.width,live.height);
-    lctx.save();applyVP(lctx);lctx.translate(s.cx,s.cy);lctx.scale(.82+.18*sp,.82+.18*sp);lctx.translate(-s.cx,-s.cy);
+    lctx.save();
+    applyVP(lctx);lctx.translate(s.cx,s.cy);lctx.scale(.82+.18*sp,.82+.18*sp);lctx.translate(-s.cx,-s.cy);
+    // FIX: was setting globalAlpha directly without save/restore — now contained in save/restore block
     lctx.globalAlpha=Math.min(t*4,1);lctx.strokeStyle=s.color;lctx.lineWidth=s.w;lctx.lineCap='round';
-    lctx.beginPath();lctx.arc(s.cx,s.cy,s.r,0,Math.PI*2);lctx.stroke();lctx.restore();
+    lctx.beginPath();lctx.arc(s.cx,s.cy,s.r,0,Math.PI*2);lctx.stroke();
+    lctx.restore();
     t<1?requestAnimationFrame(frame):cb();
   })(t0);
 }
@@ -115,8 +122,16 @@ function pushHistory(){
   histIdx++;_ub();draft.save();
 }
 const _ub=()=>{BU.disabled=!histIdx;BR.disabled=histIdx===undoStack.length-1;};
-const clearLive=()=>{lctx.setTransform(1,0,0,1,0,0);lctx.clearRect(0,0,live.width,live.height);};
 
+// FIX: also reset globalAlpha and compositeOperation so callers don't leak drawing state
+const clearLive=()=>{
+  lctx.setTransform(1,0,0,1,0,0);
+  lctx.clearRect(0,0,live.width,live.height);
+  lctx.globalAlpha=1;
+  lctx.globalCompositeOperation='source-over';
+};
+
+// Incremental segment renderer — expects applyVP already set on ctx, draws only the newest segment
 function appendSeg(ctx,pts,color,w){
   const n=pts.length;if(n<2)return;
   ctx.strokeStyle=ctx.fillStyle=color;ctx.lineWidth=w;ctx.lineCap='round';ctx.lineJoin='round';
@@ -135,7 +150,8 @@ async function commitStroke(){
       drawPts=[];clearLive();
       const s={type:'circle',cx:c.cx,cy:c.cy,r:c.r,color:COLORS[ci],w:ew};
       if(recording)replayLog.push({t:now(),s:JSON.parse(JSON.stringify(s))});
-      animateCircleSnap(s,()=>{strokes=[...strokes,s];pushHistory();wr();clearLive();});return;
+      animateCircleSnap(s,()=>{strokes=[...strokes,s];pushHistory();wr();clearLive();});
+      return;
     }
   }
   const raw={type:isE?'eraser':'pen',color:COLORS[ci],w:ew,pts:drawPts};
@@ -143,7 +159,11 @@ async function commitStroke(){
   const s=spts?{...raw,pts:spts}:simplify(raw);
   if(recording)replayLog.push({t:now(),s:JSON.parse(JSON.stringify(s))});
   strokes=[...strokes,s];pushHistory();
-  if(!isE)wr();clearLive();drawPts=[];
+  // FIX: was `if(!isE)wr()` — eraser strokes never triggered a worker redraw,
+  //      so the base canvas stayed unchanged and erasure was invisible.
+  wr();
+  clearLive();
+  drawPts=[];
 }
 
 const cancelStroke=()=>{drawPts=[];clearLive();};
@@ -152,14 +172,19 @@ const now=()=>performance.now()-recordStart;
 function startDraw(sx,sy){
   isDrawing=true;const p=s2w(sx,sy);drawPts=[p];
   const isE=tool==='eraser',ew=isE?ERASER_W[wi]:PEN_W[wi];
-  applyVP(lctx);lctx.fillStyle=isE?'#fff':COLORS[ci];lctx.beginPath();lctx.arc(p.x,p.y,ew/2,0,Math.PI*2);lctx.fill();
+  applyVP(lctx);
+  lctx.fillStyle=isE?'#fff':COLORS[ci];
+  lctx.beginPath();lctx.arc(p.x,p.y,ew/2,0,Math.PI*2);lctx.fill();
 }
+
 function continueDraw(sx,sy){
   if(!isDrawing)return;
   const p=s2w(sx,sy),last=drawPts[drawPts.length-1];
   const dx=(p.x-last.x)*vp.scale,dy=(p.y-last.y)*vp.scale;
   if(dx*dx+dy*dy<4)return;
   drawPts.push(p);
+  // FIX: re-apply VP each segment — defensive against any state that might have drifted
+  applyVP(lctx);
   const isE=tool==='eraser';
   appendSeg(lctx,drawPts,isE?'#fff':COLORS[ci],isE?ERASER_W[wi]:PEN_W[wi]);
 }
@@ -208,7 +233,8 @@ live.addEventListener('pointerleave',e=>{if(!AP.has(e.pointerId)){curSX=-999;dra
 live.addEventListener('wheel',e=>{
   e.preventDefault();if(isDrawing)return;
   if(e.ctrlKey||e.metaKey)zoomAt(Math.pow(.998,e.deltaY),e.clientX,e.clientY);
-  else{vp.x-=e.deltaX*1.2;vp.y-=e.deltaY*1.2;ZH.textContent=Math.round(vp.scale*100)+'%';}
+  else{vp.x-=e.deltaX*1.2;vp.y-=e.deltaY*1.2;}
+  ZH.textContent=Math.round(vp.scale*100)+'%';
   wr();if(tool==='eraser'&&curSX>0)drawCursorAt(curSX,curSY);
 },{passive:false});
 
@@ -260,7 +286,7 @@ function commitText(){
   _txC=false;
 }
 
-// ── Binary codec (shared encode/decode stroke) ──
+// ── Binary codec ──
 const _vw=(o,v)=>{v>>>=0;do{let b=v&127;v>>>=7;o.push(v?b|128:b)}while(v)};
 const _zw=(o,v)=>_vw(o,v>=0?v*2:(-v-1)*2+1);
 const _vr=(b,p)=>{let v=0,s=0;do{const x=b[p.i++];v|=(x&127)<<s;s+=7;if(!(x&128))break}while(1);return v>>>0};
@@ -366,7 +392,7 @@ async function fromHash(hash){
   return null;
 }
 
-// ── Draft (Temporal API) ──
+// ── Draft (auto-save) ──
 const draft={
   KEY:'cicada_draft_v2',
   save(){
@@ -379,7 +405,13 @@ const draft={
     },1500);
   },
   load(){
-    try{const{hash,ts,count}=JSON.parse(localStorage.getItem(this.KEY)||'null');const age=Date.now()-ts;if(age>604800000){this.clear();return null;}return{hash,age,count};}catch{return null;}
+    try{
+      const raw=localStorage.getItem(this.KEY);
+      if(!raw)return null;
+      const{hash,ts,count}=JSON.parse(raw);
+      if(Date.now()-ts>604800000){this.clear();return null;}
+      return{hash,age:Date.now()-ts,count};
+    }catch{return null;}
   },
   clear(){localStorage.removeItem(this.KEY);}
 };
@@ -390,7 +422,7 @@ async function playReplay(log){
   if(!log?.length||replayActive)return;
   replayActive=true;const saved=strokes.slice();strokes=[];wr();
   const temp=[],t0=performance.now(),ts=log[0].t;
-  await new Promise(r=>{let i=0;(function frame(now){const el=now-t0;while(i<log.length&&log[i].t-ts<=el)temp.push(log[i++].s);strokes=temp.slice();wr();i<log.length?requestAnimationFrame(frame):r();})( t0);});
+  await new Promise(r=>{let i=0;(function frame(now){const el=now-t0;while(i<log.length&&log[i].t-ts<=el)temp.push(log[i++].s);strokes=temp.slice();wr();i<log.length?requestAnimationFrame(frame):r();})(t0);});
   strokes=saved;wr();replayActive=false;
 }
 
@@ -402,11 +434,14 @@ function showPopover(btn){
   document.body.appendChild(pop);
   const r=btn.getBoundingClientRect();
   pop.style.cssText=`position:fixed;z-index:50;bottom:${innerHeight-r.top+8}px;left:${r.left+r.width/2}px;transform:translateX(-50%);background:var(--glass);-webkit-backdrop-filter:blur(24px) saturate(180%);backdrop-filter:blur(24px) saturate(180%);border:.5px solid var(--glass-border);border-radius:14px;padding:6px;display:flex;flex-direction:column;gap:2px;box-shadow:0 4px 28px rgba(0,0,0,.13);animation:fadeIn .18s ease both`;
-  const cl=e=>{if(!pop.contains(e.target)&&e.target!==btn){pop.remove();removeEventListener('pointerdown',cl);}};
-  setTimeout(()=>addEventListener('pointerdown',cl),10);
-  $('sp-a').onclick=()=>{pop.remove();savePNG();};
-  $('sp-b').onclick=()=>{pop.remove();copySVG();};
-  $('sp-c').onclick=()=>{pop.remove();copyLink();};
+  // FIX: outside-click listener was never removed when popover was closed via button click (memory leak).
+  //      Now removeListener is called in every close path.
+  const dismiss=()=>{pop.remove();removeEventListener('pointerdown',outsideClick);};
+  const outsideClick=e=>{if(!pop.contains(e.target)&&e.target!==btn)dismiss();};
+  setTimeout(()=>addEventListener('pointerdown',outsideClick),10);
+  $('sp-a').onclick=()=>{dismiss();savePNG();};
+  $('sp-b').onclick=()=>{dismiss();copySVG();};
+  $('sp-c').onclick=()=>{dismiss();copyLink();};
 }
 
 async function savePNG(){
