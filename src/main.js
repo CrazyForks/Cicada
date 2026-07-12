@@ -13,33 +13,25 @@ let vp={x:0,y:0,scale:1},tool='pen',ci=0,wi=0;
 let strokes=[],undoStack=[[]],histIdx=0;
 let isDrawing=false,drawPts=[];
 let spaceDown=false,mousePanning=false,midPanning=false;
-let panStart,vpAtPanStart,rafId;
+let panStart,vpAtPanStart;
 let curSX=-999,curSY=-999;
-// FIX: initialise recordStart immediately so now() is never NaN
-let recording=true,replayLog=[],recordStart=performance.now();
 
-// ── Worker (OffscreenCanvas + ESM) ──
-const pending=new Map();let sid=0,wk;
+// ── Worker (OffscreenCanvas + ESM, fire-and-forget) ──
+let wk;
 {
   const off=base.transferControlToOffscreen();
   wk = new InlineWorker();
-  wk.onmessage=({data})=>{
-    if(data.type==='simplified'){pending.get(data.id)?.(data.pts);pending.delete(data.id);}
-  };
   wk.postMessage({type:'init',canvas:off,dpr,vp:{...vp},strokes:[]},[off]);
 }
 const wr=(ss,v,sz)=>{const m={type:'update',strokes:ss??strokes,vp:v??{...vp}};if(sz)m.size=sz;wk.postMessage(m);};
-// FIX: was {type:'simplify',id,pts,type,w} — duplicate 'type' key meant the stroke-type
-//      variable overwrote 'simplify', so the worker never matched the simplify branch,
-//      pending promises never resolved, and commitStroke hung forever for any stroke > 2pts.
-const ws=(pts,strokeType,w)=>new Promise(r=>{const id=sid++;pending.set(id,r);wk.postMessage({type:'simplify',id,pts,strokeType,w});});
 
 function resize(){
   const W=innerWidth,H=innerHeight,pw=Math.round(W*dpr),ph=Math.round(H*dpr);
   for(const c of[live,cur]){c.width=pw;c.height=ph;c.style.width=W+'px';c.style.height=H+'px';}
-  wr();drawCursorAt(curSX,curSY);
+  wr(null,null,{w:pw,h:ph});
+  drawCursorAt(curSX,curSY);
 }
-addEventListener('resize',()=>{wr(null,null,{w:Math.round(innerWidth*dpr),h:Math.round(innerHeight*dpr)});resize();});
+addEventListener('resize',resize);
 
 const s2w=(sx,sy)=>({x:(sx-vp.x)/vp.scale,y:(sy-vp.y)/vp.scale});
 const applyVP=ctx=>ctx.setTransform(vp.scale*dpr,0,0,vp.scale*dpr,vp.x*dpr,vp.y*dpr);
@@ -52,7 +44,7 @@ const zoomAt=(f,cx,cy)=>setZoom(clamp(vp.scale*f,.05,20),cx,cy);
 function renderStroke(ctx,s){
   ctx.save();
   if(s.type==='text'){
-    ctx.fillStyle=s.color;ctx.font=`${s.fs}px 'Lora',Georgia,serif`;
+    ctx.fillStyle=s.color;ctx.font=`${s.fs}px Georgia,serif`;
     s.text.split('\n').forEach((ln,i)=>ctx.fillText(ln,s.x,s.y+i*s.fs*1.35));
   }else if(s.type==='circle'){
     ctx.strokeStyle=s.color;ctx.lineWidth=s.w;ctx.lineCap='round';
@@ -103,6 +95,21 @@ function detectCircle(pts){
   return{cx,cy,r};
 }
 
+function detectLine(pts,w){
+  if(pts.length<6)return null;
+  const a=pts[0],b=pts[pts.length-1];
+  const dx=b.x-a.x,dy=b.y-a.y,len=Math.hypot(dx,dy);
+  if(len<20)return null;
+  const thresh=Math.max(w*2,12);
+  for(const p of pts){
+    const d=Math.abs(dy*p.x-dx*p.y+b.x*a.y-b.y*a.x)/len;
+    if(d>thresh)return null;
+  }
+  const eps=RDP_EPS[PEN_W.indexOf(w)]??2;
+  if(rdp(pts,eps).length>3)return null;
+  return[a,b];
+}
+
 function animateCircleSnap(s,cb){
   const dur=340,t0=performance.now();
   (function frame(now){
@@ -143,7 +150,7 @@ function appendSeg(ctx,pts,color,w){
   ctx.stroke();
 }
 
-async function commitStroke(){
+function commitStroke(){
   if(!drawPts.length)return;
   const isE=tool==='eraser',ew=isE?ERASER_W[wi]:PEN_W[wi];
   if(!isE){
@@ -151,25 +158,25 @@ async function commitStroke(){
     if(c){
       drawPts=[];clearLive();
       const s={type:'circle',cx:c.cx,cy:c.cy,r:c.r,color:COLORS[ci],w:ew};
-      if(recording)replayLog.push({t:now(),s:JSON.parse(JSON.stringify(s))});
       animateCircleSnap(s,()=>{strokes=[...strokes,s];pushHistory();wr();clearLive();});
+      return;
+    }
+    const line=detectLine(drawPts,ew);
+    if(line){
+      drawPts=[];clearLive();
+      const s={type:'pen',color:COLORS[ci],w:ew,pts:line};
+      strokes=[...strokes,s];pushHistory();wr();clearLive();
       return;
     }
   }
   const raw={type:isE?'eraser':'pen',color:COLORS[ci],w:ew,pts:drawPts};
-  const spts=drawPts.length>2?await ws(drawPts,raw.type,ew):null;
-  const s=spts?{...raw,pts:spts}:simplify(raw);
-  if(recording)replayLog.push({t:now(),s:JSON.parse(JSON.stringify(s))});
+  const s=simplify(raw);
   strokes=[...strokes,s];pushHistory();
-  // FIX: was `if(!isE)wr()` — eraser strokes never triggered a worker redraw,
-  //      so the base canvas stayed unchanged and erasure was invisible.
   wr();
   clearLive();
   drawPts=[];
 }
 
-const cancelStroke=()=>{drawPts=[];clearLive();};
-const now=()=>performance.now()-recordStart;
 
 function startDraw(sx,sy){
   isDrawing=true;const p=s2w(sx,sy);drawPts=[p];
@@ -191,6 +198,7 @@ function continueDraw(sx,sy){
   appendSeg(lctx,drawPts,isE?'#fff':COLORS[ci],isE?ERASER_W[wi]:PEN_W[wi]);
 }
 const endDraw=()=>{if(isDrawing){isDrawing=false;commitStroke();}};
+const cancelStroke=()=>{drawPts=[];clearLive();};
 
 // ── Input ──
 const AP=new Map();let dpid=-1,pinch=null;
@@ -265,7 +273,6 @@ document.querySelectorAll('.wb').forEach((b,i)=>{b.addEventListener('click',()=>
 $('zoom-hud').addEventListener('click',()=>{vp={x:0,y:0,scale:1};ZH.textContent='100%';wr();drawCursorAt(curSX,curSY);});
 
 // ── Text tool ──
-let _txC=false;
 function openText(sx,sy){
   const p=s2w(sx,sy),fs=FONT_SZ[wi],sfs=fs*vp.scale;
   ti.style.cssText=`display:block;left:${sx}px;top:${sy-sfs*.82}px;font-size:${sfs}px;color:${COLORS[ci]};height:auto;min-height:${sfs*1.35}px`;
@@ -276,16 +283,15 @@ ti.addEventListener('keydown',e=>{
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();commitText();return;}
   setTimeout(()=>{ti.style.height='auto';ti.style.height=ti.scrollHeight+'px';},0);
 });
-ti.addEventListener('blur',()=>{if(!_txC)commitText();});
+ti.addEventListener('blur',()=>commitText());
 function commitText(){
-  if(_txC||ti.style.display==='none')return;_txC=true;ti.style.display='none';
+  if(ti.style.display==='none')return;
+  ti.style.display='none';
   const txt=ti.value.trim();
   if(txt){
     const s={type:'text',text:txt,color:COLORS[+ti.dataset.ci],x:+ti.dataset.wx,y:+ti.dataset.wy,fs:+ti.dataset.fs};
-    if(recording)replayLog.push({t:now(),s:JSON.parse(JSON.stringify(s))});
     strokes=[...strokes,s];pushHistory();wr();
   }
-  _txC=false;
 }
 
 // ── Binary codec ──
@@ -335,19 +341,12 @@ function encodeBody(ss,vport){
   if(vport){const su=Math.round(vport.scale*1000)&0xFFFF;o.push(su&255,su>>8);_zw(o,Math.round(vport.cx));_zw(o,Math.round(vport.cy));}
   o.push(ss.length&255,ss.length>>8);for(const s of ss)_encStroke(o,s);return new Uint8Array(o);
 }
-function encodeReplay(log){
-  const o=[];_vw(o,log.length);let pt=0;
-  for(const{t,s}of log){_vw(o,Math.round(t-pt));pt=t;_encStroke(o,s);}
-  return new Uint8Array(o);
-}
 function decodeBody(bytes,hasVP){
   const p={i:0};let rvp=null;
   if(hasVP){const su=bytes[p.i]|(bytes[p.i+1]<<8);p.i+=2;rvp={scale:su/1000,cx:_zr(bytes,p),cy:_zr(bytes,p)};}
   const count=bytes[p.i]|(bytes[p.i+1]<<8);p.i+=2;
   const ss=[];for(let i=0;i<count;i++)ss.push(_decStroke(bytes,p));
-  let log=null;
-  if(p.i<bytes.length)try{const n=_vr(bytes,p);const l=[];let t=0;for(let i=0;i<n;i++){t+=_vr(bytes,p);l.push({t,s:_decStroke(bytes,p)});}log=l;}catch{}
-  return{strokes:ss,vp:rvp,log};
+  return{strokes:ss,vp:rvp};
 }
 
 const toB64u=b=>{let s='';for(let i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'')};
@@ -374,12 +373,10 @@ async function decompress(bytes){
   }catch{return bytes;}
 }
 
-async function toHash(ss,withReplay){
+async function toHash(ss){
   const W=innerWidth,H=innerHeight;
   const body=encodeBody(ss,{scale:vp.scale,cx:Math.round((-vp.x+W/2)/vp.scale),cy:Math.round((-vp.y+H/2)/vp.scale)});
-  let full=body;
-  if(withReplay&&replayLog.length){const rl=encodeReplay(replayLog);full=new Uint8Array(body.length+rl.length);full.set(body);full.set(rl,body.length);}
-  const{b:pl,v}=await compress(full);
+  const{b:pl,v}=await compress(body);
   const pkg=new Uint8Array(2+pl.length);pkg[0]=0xAB;pkg[1]=v?5:4;pkg.set(pl,2);
   return toB64u(pkg);
 }
@@ -387,9 +384,6 @@ async function fromHash(hash){
   try{
     const bytes=fromB64u(hash);
     if(bytes[0]===0xAB){const v=bytes[1];let body=bytes.slice(2);if(v===3||v===5)body=await decompress(body);return decodeBody(body,v===4||v===5);}
-  }catch(e){console.warn(e);}
-  try{
-    if(typeof LZString!=='undefined'){const j=LZString.decompressFromEncodedURIComponent(hash);if(j){const CV={'var(--c0)':'#363028','var(--c1)':'#C9A89A','var(--c2)':'#8FA89A','var(--c3)':'#8A9BAE','var(--c4)':'#C4B49A','var(--c5)':'#A898AE'};return{strokes:JSON.parse(j).map(s=>({...s,color:CV[s.color]||s.color||COLORS[0]})),vp:null,log:null};}}
   }catch(e){console.warn(e);}
   return null;
 }
@@ -401,8 +395,7 @@ const draft={
     clearTimeout(this._t);
     this._t=setTimeout(async()=>{
       try{
-        const ts=('Temporal' in globalThis)?Temporal.Now.instant().epochMilliseconds:Date.now();
-        localStorage.setItem(this.KEY,JSON.stringify({hash:await toHash(strokes,false),ts,count:strokes.length}));
+        localStorage.setItem(this.KEY,JSON.stringify({hash:await toHash(strokes),ts:Date.now(),count:strokes.length}));
       }catch{}
     },1500);
   },
@@ -418,21 +411,11 @@ const draft={
   clear(){localStorage.removeItem(this.KEY);}
 };
 
-// ── Replay playback ──
-let replayActive=false;
-async function playReplay(log){
-  if(!log?.length||replayActive)return;
-  replayActive=true;const saved=strokes.slice();strokes=[];wr();
-  const temp=[],t0=performance.now(),ts=log[0].t;
-  await new Promise(r=>{let i=0;(function frame(now){const el=now-t0;while(i<log.length&&log[i].t-ts<=el)temp.push(log[i++].s);strokes=temp.slice();wr();i<log.length?requestAnimationFrame(frame):r();})(t0);});
-  strokes=saved;wr();replayActive=false;
-}
-
 // ── Share popover ──
 function showPopover(btn){
   const ex=$('sp');if(ex){ex.remove();return;}
   const pop=document.createElement('div');pop.id='sp';
-  pop.innerHTML='<button id="sp-a">Save as PNG</button><button id="sp-b">Copy SVG</button><button id="sp-c">Copy link</button>';
+  pop.innerHTML='<button id="sp-a">Save as PNG</button><button id="sp-c">Copy link</button>';
   document.body.appendChild(pop);
   const r=btn.getBoundingClientRect();
   pop.style.cssText=`position:fixed;z-index:50;bottom:${innerHeight-r.top+8}px;left:${r.left+r.width/2}px;transform:translateX(-50%);background:var(--glass);-webkit-backdrop-filter:blur(24px) saturate(180%);backdrop-filter:blur(24px) saturate(180%);border:.5px solid var(--glass-border);border-radius:14px;padding:6px;display:flex;flex-direction:column;gap:2px;box-shadow:0 4px 28px rgba(0,0,0,.13);animation:fadeIn .18s ease both`;
@@ -442,7 +425,6 @@ function showPopover(btn){
   const outsideClick=e=>{if(!pop.contains(e.target)&&e.target!==btn)dismiss();};
   setTimeout(()=>addEventListener('pointerdown',outsideClick),10);
   $('sp-a').onclick=()=>{dismiss();savePNG();};
-  $('sp-b').onclick=()=>{dismiss();copySVG();};
   $('sp-c').onclick=()=>{dismiss();copyLink();};
 }
 
@@ -463,26 +445,10 @@ async function savePNG(){
   a.click();URL.revokeObjectURL(a.href);toast('PNG saved');
 }
 
-function copySVG(){
-  const paths=strokes.map(s=>{
-    if(s.type==='pen'||s.type==='eraser'){
-      const p=s.pts||[];if(!p.length)return'';
-      let d=`M${p[0].x},${p[0].y}`;
-      for(let i=1;i<p.length-1;i++)d+=`Q${p[i].x},${p[i].y} ${(p[i].x+p[i+1].x)/2},${(p[i].y+p[i+1].y)/2}`;
-      if(p.length>1)d+=`L${p[p.length-1].x},${p[p.length-1].y}`;
-      return`<path d="${d}" stroke="${s.type==='eraser'?'#fff':s.color}" stroke-width="${s.w}" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`;
-    }
-    if(s.type==='circle')return`<circle cx="${s.cx}" cy="${s.cy}" r="${s.r}" stroke="${s.color}" stroke-width="${s.w}" fill="none"/>`;
-    if(s.type==='text')return`<text x="${s.x}" y="${s.y}" font-size="${s.fs}" fill="${s.color}" font-family="Georgia,serif">${s.text.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</text>`;
-    return'';
-  }).join('');
-  navigator.clipboard.writeText(`<svg xmlns="http://www.w3.org/2000/svg" style="background:#fff">${paths}</svg>`).then(()=>toast('SVG copied')).catch(()=>toast('Copy failed'));
-}
-
 async function copyLink(){
   const btn=$('btn-save');btn.disabled=true;btn.style.opacity='.25';
   try{
-    const hash=await toHash(strokes,recording);
+    const hash=await toHash(strokes);
     history.replaceState(null,'','#'+hash);
     await navigator.clipboard.writeText(location.href).catch(()=>{});
     toast(`Link copied · ${(hash.length*.75/1024).toFixed(1)} KB`);
@@ -513,18 +479,12 @@ function fitContent(){
 document.head.insertAdjacentHTML('beforeend',`<style>
 #sp button{display:block;width:100%;padding:9px 18px;border:none;background:transparent;font-size:13px;font-weight:500;text-align:left;cursor:pointer;border-radius:9px;color:var(--label);transition:background .1s}
 #sp button:hover{background:var(--fill)}
-#btn-record.on{color:#ff3b30;opacity:1}
 #toast.show{pointer-events:auto}
 </style>`);
 
 // ── Init ──
 (async()=>{
   resize();_ub();setCursor('pen');
-  $('btn-record').addEventListener('click',()=>{
-    recording=!recording;
-    $('btn-record').classList.toggle('on',recording);
-    toast(recording?'Replay recording on':'Replay recording off');
-  });
 
   const h=location.hash.slice(1);
   if(h){
@@ -534,7 +494,6 @@ document.head.insertAdjacentHTML('beforeend',`<style>
       if(result.vp){vp.scale=result.vp.scale;vp.x=innerWidth/2-result.vp.cx*vp.scale;vp.y=innerHeight/2-result.vp.cy*vp.scale;ZH.textContent=Math.round(vp.scale*100)+'%';}
       else fitContent();
       wr();_ub();draft.clear();
-      if(result.log?.length)setTimeout(()=>playReplay(result.log),400);
     }
   }else{
     const d=draft.load();
@@ -546,5 +505,4 @@ document.head.insertAdjacentHTML('beforeend',`<style>
       $('dd').onclick=()=>{draft.clear();TT.classList.remove('show');};
     }
   }
-  recordStart=performance.now();
 })();

@@ -53,7 +53,7 @@ html,body{
     outline:none;
     resize:none;
     overflow:hidden;
-    font-family:'Lora',Georgia,serif;
+    font-family:Georgia,serif;
     line-height:1.35;
     padding:0;
     min-width:40px;
