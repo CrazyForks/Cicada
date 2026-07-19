@@ -144,14 +144,29 @@ const clearLive=()=>{
   lctx.globalCompositeOperation='source-over';
 };
 
-// Incremental segment renderer — expects applyVP already set on ctx, draws only the newest segment
-function appendSeg(ctx,pts,color,w){
-  const n=pts.length;if(n<2)return;
-  ctx.strokeStyle=ctx.fillStyle=color;ctx.lineWidth=w;ctx.lineCap='round';ctx.lineJoin='round';
-  ctx.beginPath();
-  if(n===2){ctx.moveTo(pts[0].x,pts[0].y);ctx.lineTo(pts[1].x,pts[1].y);}
-  else{const i=n-2,p0=pts[i-1]??pts[i];ctx.moveTo((p0.x+pts[i].x)/2,(p0.y+pts[i].y)/2);ctx.quadraticCurveTo(pts[i].x,pts[i].y,(pts[i].x+pts[i+1].x)/2,(pts[i].y+pts[i+1].y)/2);}
-  ctx.stroke();
+// FIX Bug2: Draw the entire in-progress stroke as one continuous path on the live canvas.
+// The old appendSeg drew only the newest Bezier segment, causing overlap at the junction
+// midpoints (each midpoint was rendered twice), making stroke thickness visually uneven.
+// By clearing live and redrawing the full path each move we match the committed renderStroke
+// path exactly, producing uniform thickness at all zoom levels.
+// FIX Bug1: Always reset+reapply the transform before redrawing so that any vp change that
+// happened during the stroke (wheel pan, etc.) doesn't offset new segments from old ones.
+function drawLiveStroke(pts,color,w,isE){
+  lctx.setTransform(1,0,0,1,0,0);
+  lctx.clearRect(0,0,live.width,live.height);
+  applyVP(lctx);
+  if(isE){lctx.globalCompositeOperation='destination-out';lctx.strokeStyle=lctx.fillStyle='rgba(0,0,0,1)';}
+  else{lctx.globalCompositeOperation='source-over';lctx.strokeStyle=lctx.fillStyle=color;}
+  lctx.lineWidth=w;lctx.lineCap='round';lctx.lineJoin='round';
+  const n=pts.length;
+  if(n===1){lctx.beginPath();lctx.arc(pts[0].x,pts[0].y,w/2,0,Math.PI*2);lctx.fill();}
+  else{
+    lctx.beginPath();
+    lctx.moveTo(pts[0].x,pts[0].y);
+    for(let i=1;i<n-1;i++)lctx.quadraticCurveTo(pts[i].x,pts[i].y,(pts[i].x+pts[i+1].x)/2,(pts[i].y+pts[i+1].y)/2);
+    lctx.lineTo(pts[n-1].x,pts[n-1].y);
+    lctx.stroke();
+  }
 }
 
 function commitStroke(){
@@ -185,12 +200,9 @@ function commitStroke(){
 function startDraw(sx,sy){
   isDrawing=true;const p=s2w(sx,sy);drawPts=[p];
   const isE=tool==='eraser',ew=isE?ERASER_W[wi]:PEN_W[wi];
-  applyVP(lctx);
-  // FIX: eraser on transparent live canvas must use destination-out to punch through
-  // to the white base canvas. Drawing white (#fff) on transparent is invisible.
-  if(isE){lctx.globalCompositeOperation='destination-out';lctx.fillStyle='rgba(0,0,0,1)';}
-  else{lctx.globalCompositeOperation='source-over';lctx.fillStyle=COLORS[ci];}
-  lctx.beginPath();lctx.arc(p.x,p.y,ew/2,0,Math.PI*2);lctx.fill();
+  // FIX Bug1+2: use drawLiveStroke for the initial dot so the live canvas is
+  // always drawn with a clean transform + full-path approach from the very first point.
+  drawLiveStroke(drawPts,COLORS[ci],ew,isE);
 }
 
 function continueDraw(sx,sy){
@@ -199,11 +211,10 @@ function continueDraw(sx,sy){
   const dx=(p.x-last.x)*vp.scale,dy=(p.y-last.y)*vp.scale;
   if(dx*dx+dy*dy<4)return;
   drawPts.push(p);
-  applyVP(lctx);
-  const isE=tool==='eraser';
-  // FIX: same destination-out fix for live segments
-  if(isE){lctx.globalCompositeOperation='destination-out';appendSeg(lctx,drawPts,'rgba(0,0,0,1)',ERASER_W[wi]);}
-  else{lctx.globalCompositeOperation='source-over';appendSeg(lctx,drawPts,COLORS[ci],PEN_W[wi]);}
+  const isE=tool==='eraser',ew=isE?ERASER_W[wi]:PEN_W[wi];
+  // FIX Bug1+2: drawLiveStroke clears+redraws the entire in-progress stroke each frame,
+  // ensuring consistent transform alignment and uniform line thickness throughout.
+  drawLiveStroke(drawPts,COLORS[ci],ew,isE);
 }
 const endDraw=()=>{if(isDrawing){isDrawing=false;commitStroke();}};
 const cancelStroke=()=>{drawPts=[];clearLive();};
